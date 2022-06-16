@@ -36,14 +36,21 @@ union pca_rule
     struct
     {
         unsigned int lba : 16;
-        unsigned int nand: 16;
+        unsigned int nand: 16;  // the physical block this pca reside in
     } fields;
 };
 
 PCA_RULE curr_pca;
 static unsigned int get_next_pca();
+void GC();
+static int ftl_read( char* buf, size_t lba);
 
-unsigned int* L2P,* P2L,* valid_count, free_block_number;
+unsigned int* L2P,* P2L,* valid_count, free_block_number,* pca_status;
+/*
+  L2P: logic page number to physical page number
+  P2L: physical page number to logic page number
+  valid_count: records number of programmed pages in each block
+*/
 
 static int ssd_resize(size_t new_size)
 {
@@ -141,11 +148,11 @@ static int nand_erase(int block_index)
 
 static unsigned int get_next_block()
 {
-    for (int i = 0; i < PHYSICAL_NAND_NUM; i++)
+    for (int i = 0; i < PHYSICAL_NAND_NUM; i++) // iterate through all nand(block) from current nand
     {
         if (valid_count[(curr_pca.fields.nand + i) % PHYSICAL_NAND_NUM] == FREE_BLOCK)
         {
-            curr_pca.fields.nand = (curr_pca.fields.nand + i) % PHYSICAL_NAND_NUM;
+            curr_pca.fields.nand = (curr_pca.fields.nand + i) % PHYSICAL_NAND_NUM;  // get a free nand(block)
             curr_pca.fields.lba = 0;
             free_block_number--;
             valid_count[curr_pca.fields.nand] = 0;
@@ -165,7 +172,7 @@ static unsigned int get_next_pca()
         return curr_pca.pca;
     }
 
-    if(curr_pca.fields.lba == 9)
+    if(curr_pca.fields.lba == 9)  // current physical block is full
     {
         int temp = get_next_block();
         if (temp == OUT_OF_BLOCK)
@@ -189,15 +196,58 @@ static unsigned int get_next_pca()
 
 }
 
+void GC() {
+    unsigned int min_valid_count = PAGE_PER_BLOCK, victim = 0;
+    for (int i = 1; i < PHYSICAL_NAND_NUM; ++i) {
+        int idx = (curr_pca.fields.nand + i) % PHYSICAL_NAND_NUM;
+        if (valid_count[idx] < PAGE_PER_BLOCK) {
+            for (int j = idx; j < idx + PAGE_PER_BLOCK; ++j) {
+                if(curr_pca.pca == FULL_PCA)
+                    get_next_pca();
+                if (pca_status[j] == VALID_PCA) {
+                    char *buffer[512];
+                    ftl_read(buffer, P2L[j]);
+                    nand_write(buffer, curr_pca.pca);
+                    L2P[P2L[j]] = curr_pca.pca;
+                    P2L[curr_pca.fields.nand * PAGE_PER_BLOCK + curr_pca.fields.lba] = P2L[j];
+                    P2L[j] = INVALID_LBA;
+                    pca_status[j] = STALE_PCA;
+                    pca_status[curr_pca.fields.nand * PAGE_PER_BLOCK + curr_pca.fields.lba] = VALID_PCA;
+                    valid_count[curr_pca.fields.nand] += 1;
+                    curr_pca.fields.lba += 1;
+                }
+            }
+            valid_count[idx] = 0;
+            nand_erase(idx);
+        }
+    }
+}
+
 
 static int ftl_read( char* buf, size_t lba)
 {
-    // TODO
+    nand_read(buf, L2P[lba]);
 }
 
 static int ftl_write(const char* buf, size_t lba_rnage, size_t lba)
-{
-    // TODO
+{   
+    
+    unsigned int pca = get_next_pca();
+    if (free_block_number == 0)
+        GC();
+    nand_write(buf, pca);
+    if (L2P[lba] != INVALID_PCA) {
+        PCA_RULE old_pca;
+        old_pca.pca = L2P[lba];
+        unsigned int old_pca_idx = old_pca.fields.nand * PAGE_PER_BLOCK + old_pca.fields.lba;
+        pca_status[old_pca_idx] = STALE_PCA;
+    }
+    PCA_RULE new_pca;
+    new_pca.pca = pca;
+    unsigned int new_pca_idx = new_pca.fields.nand * PAGE_PER_BLOCK + new_pca.fields.lba;
+    P2L[new_pca_idx] = lba;
+    L2P[lba] = pca;
+    pca_status[new_pca_idx] = VALID_PCA;
 }
 
 
@@ -261,13 +311,12 @@ static int ssd_do_read(char* buf, size_t size, off_t offset)
         //is valid data section
         size = logic_size - offset;
     }
+    tmp_lba = offset / 512;  // start from which page
+    tmp_lba_range = (offset + size - 1) / 512 - (tmp_lba) + 1;  // total page count
+    tmp_buf = calloc(tmp_lba_range * 512, sizeof(char));  // read data into this buffer
 
-    tmp_lba = offset / 512;
-    tmp_lba_range = (offset + size - 1) / 512 - (tmp_lba) + 1;
-    tmp_buf = calloc(tmp_lba_range * 512, sizeof(char));
-
-    for (int i = 0; i < tmp_lba_range; i++) {
-        // TODO
+    for (int i = 0; i < tmp_lba_range; i++) {  // read full pages
+        ftl_read(tmp_buf + i * 512, tmp_lba + i);
     }
 
     memcpy(buf, tmp_buf + offset % 512, size);
@@ -304,10 +353,28 @@ static int ssd_do_write(const char* buf, size_t size, off_t offset)
     process_size = 0;
     remain_size = size;
     curr_size = 0;
-    for (idx = 0; idx < tmp_lba_range; idx++)
-    {
-        // TODO
+    size_t buf_idx = 0;
+    tmp_buf = calloc(512, sizeof(char));
+    for (idx = 0; idx < tmp_lba_range; ++idx) {       
+        if (idx == 0 || idx == tmp_lba_range - 1) {
+            nand_read(tmp_buf, L2P[tmp_lba + idx]);
+            size_t begin = 0, end = 512;
+            if (idx == 0)
+                begin = offset % 512;
+            if (idx == tmp_lba_range - 1)
+                end = (offset + size) % 512;
+            if (end == 0)
+                end = 512;
+            for (int i = begin; i < end; ++i)
+                tmp_buf[i] = buf[buf_idx++];
+            ftl_write(tmp_buf, tmp_lba_range, tmp_lba + idx);
+        }
+        else {
+            ftl_write(buf + buf_idx, tmp_lba_range, tmp_lba + idx);
+            buf_idx += 512;
+        } 
     }
+    free(tmp_buf);
     return size;
 }
 static int ssd_write(const char* path, const char* buf, size_t size,
@@ -379,6 +446,9 @@ static int ssd_ioctl(const char* path, unsigned int cmd, void* arg,
     }
     return -EINVAL;
 }
+
+
+
 static const struct fuse_operations ssd_oper =
 {
     .getattr        = ssd_getattr,
@@ -404,6 +474,9 @@ int main(int argc, char* argv[])
     memset(P2L, INVALID_LBA, sizeof(int) * PHYSICAL_NAND_NUM * PAGE_PER_BLOCK);
     valid_count = malloc(PHYSICAL_NAND_NUM * sizeof(int));
     memset(valid_count, FREE_BLOCK, sizeof(int) * PHYSICAL_NAND_NUM);
+
+    pca_status = malloc(PHYSICAL_NAND_NUM * PAGE_PER_BLOCK * sizeof(int));
+    memset(pca_status, INVALID_PCA, sizeof(int) * PHYSICAL_NAND_NUM * PAGE_PER_BLOCK);
 
     //create nand file
     for (idx = 0; idx < PHYSICAL_NAND_NUM; idx++)
