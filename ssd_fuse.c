@@ -197,7 +197,6 @@ static unsigned int get_next_pca()
 }
 
 void GC() {
-    unsigned int min_valid_count = PAGE_PER_BLOCK, victim = 0;
     for (int i = 1; i < PHYSICAL_NAND_NUM; ++i) {
         int idx = (curr_pca.fields.nand + i) % PHYSICAL_NAND_NUM;
         if (valid_count[idx] < PAGE_PER_BLOCK) {
@@ -208,9 +207,11 @@ void GC() {
                     char *buffer[512];
                     ftl_read(buffer, P2L[j]);
                     nand_write(buffer, curr_pca.pca);
+                    //將L2P 、 P2L table 修改到對應的位子
                     L2P[P2L[j]] = curr_pca.pca;
                     P2L[curr_pca.fields.nand * PAGE_PER_BLOCK + curr_pca.fields.lba] = P2L[j];
                     P2L[j] = INVALID_LBA;
+
                     pca_status[j] = STALE_PCA;
                     pca_status[curr_pca.fields.nand * PAGE_PER_BLOCK + curr_pca.fields.lba] = VALID_PCA;
                     valid_count[curr_pca.fields.nand] += 1;
@@ -233,10 +234,13 @@ static int ftl_write(const char* buf, size_t lba_rnage, size_t lba)
 {   
     
     unsigned int pca = get_next_pca();
-    if (free_block_number == 0)
+    if (free_block_number == 0){  //沒有下一個空的pca可拿
         GC();
+    }
+    if(curr_pca.pca == FULL_PCA)
+        pca = get_next_pca();
     nand_write(buf, pca);
-    if (L2P[lba] != INVALID_PCA) {
+    if (L2P[lba] != INVALID_PCA) {  //檢查lba 之前已經被map 到某個pca
         PCA_RULE old_pca;
         old_pca.pca = L2P[lba];
         unsigned int old_pca_idx = old_pca.fields.nand * PAGE_PER_BLOCK + old_pca.fields.lba;
